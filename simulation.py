@@ -1,4 +1,8 @@
+import io
+import base64
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, LinearSegmentedColormap
 from matplotlib.animation import FuncAnimation
@@ -12,43 +16,6 @@ class SPHSimulation:
         self.mass_per_particle = cfg.MASS / cfg.N_PARTICLES
         self.steps_per_frame = 1
         self.remnant_mask = np.zeros(cfg.N_PARTICLES, dtype=bool)
-
-        plt.style.use('dark_background')
-        self.fig, self.ax = plt.subplots(figsize=(9, 8), facecolor='black')
-        self.fig.canvas.mpl_connect('key_press_event', self.on_key)
-        self.ax.set_xlim(-4, 4)
-        self.ax.set_ylim(-4, 4)
-        self.ax.set_aspect('equal')
-        self.ax.axis('off')
-
-        rng = np.random.default_rng(123)
-        bg_x = rng.uniform(-4, 4, 300)
-        bg_y = rng.uniform(-4, 4, 300)
-        bg_s = rng.uniform(0.1, 1.5, 300)
-        bg_alpha = rng.uniform(0.1, 0.6, 300)
-        self.ax.scatter(bg_x, bg_y, s=bg_s, c='white', alpha=bg_alpha, zorder=0)
-
-        colors = ['#550000', '#ff0000', '#ff8800', '#ffff00', '#ffffff', '#aaddff']
-        nodes = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-        self.star_cmap = LinearSegmentedColormap.from_list("star_temp", list(zip(nodes, colors)))
-
-        self.scat = self.ax.scatter([], [], s=6, c=[], cmap=self.star_cmap,
-                                    norm=LogNorm(vmin=0.01, vmax=100), alpha=1.0, zorder=15, animated=True)
-
-        cbar = plt.colorbar(self.scat, ax=self.ax, fraction=0.046, pad=0.04)
-        cbar.set_label('Temperature (Internal Energy)', color='white')
-        cbar.ax.yaxis.set_tick_params(color='white')
-        plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
-
-        # Neutron Star Remnant Scatter
-        self.remnant_scat = self.ax.scatter([], [], s=40, c='white',
-                                            edgecolors='cyan', linewidth=1.5, zorder=20, animated=True)
-
-        self.text_status = self.ax.text(0.02, 0.95, "", transform=self.ax.transAxes,
-                                        color="white", fontsize=10, family='monospace', animated=True)
-        self.text_inst = self.ax.text(0.02, 0.02,
-                                      "SPACE: Implode | [ / ] : Speed | R: Reset",
-                                      transform=self.ax.transAxes, color="gray", fontsize=9, animated=True)
 
         print("Compiling Physics Engine...")
         self.reset()
@@ -70,7 +37,6 @@ class SPHSimulation:
         self.pos[:, 1] = r_gauss * np.sin(theta)
 
         self.vel = np.zeros((cfg.N_PARTICLES, 2))
-
         self.vel[:, 0] = -self.pos[:, 1] * 0.5
         self.vel[:, 1] = self.pos[:, 0] * 0.5
 
@@ -83,21 +49,6 @@ class SPHSimulation:
         self.current_G = cfg.G_BASE
         self.remnant_mask[:] = False
         self.collapse_start_time = 0.0
-
-        if hasattr(self, 'remnant_scat'):
-            self.remnant_scat.set_offsets(np.empty((0, 2)))
-
-    def on_key(self, event):
-        if event.key == ' ':
-            self.initiate_collapse()
-        elif event.key == 'r':
-            self.reset()
-        elif event.key == 'q':
-            plt.close(self.fig)
-        elif event.key == ']':
-            self.steps_per_frame = min(self.steps_per_frame + 1, 20)
-        elif event.key == '[':
-            self.steps_per_frame = max(self.steps_per_frame - 1, 1)
 
     def initiate_collapse(self):
         if self.state != "STABLE":
@@ -134,15 +85,169 @@ class SPHSimulation:
         self.vel[shell_idx] = dirs * 40.0
         print("Phase 2: NEUTRON STAR FORMED - SHOCKWAVE EJECTED")
 
-    def update(self, frame):
+    def step_n(self, n=3):
+        """Advance simulation by n physics steps (used by Flask)."""
+        for _ in range(n):
+            phys.build_grid(self.pos, self.head, self.next_particle)
+            rho, pressure = phys.compute_density_pressure(
+                self.pos, self.u, self.mass_per_particle,
+                self.head, self.next_particle)
+            acc_grav = phys.compute_gravity(self.pos, self.mass_per_particle, self.current_G)
+            acc_sph, du_dt = phys.compute_sph_forces(
+                self.pos, self.vel, rho, pressure,
+                self.mass_per_particle, self.head, self.next_particle)
+
+            acc = acc_grav + acc_sph
+            if self.damping and self.state == "STABLE":
+                acc -= self.vel * (1.0 - cfg.DAMP_FACTOR)
+
+            dt = phys.get_dt(rho, pressure, self.vel)
+            self.time += dt
+
+            vel_half = self.vel + 0.5 * acc * dt
+            u_half = np.maximum(self.u + 0.5 * du_dt * dt, cfg.MIN_TEMP)
+            self.pos += vel_half * dt
+
+            # Full-step completion
+            phys.build_grid(self.pos, self.head, self.next_particle)
+            rho, pressure = phys.compute_density_pressure(
+                self.pos, u_half, self.mass_per_particle,
+                self.head, self.next_particle)
+            acc_grav = phys.compute_gravity(self.pos, self.mass_per_particle, self.current_G)
+            acc_sph, du_dt = phys.compute_sph_forces(
+                self.pos, vel_half, rho, pressure,
+                self.mass_per_particle, self.head, self.next_particle)
+
+            acc = acc_grav + acc_sph
+            if self.damping and self.state == "STABLE":
+                acc -= vel_half * (1.0 - cfg.DAMP_FACTOR)
+
+            self.vel = vel_half + 0.5 * acc * dt
+            self.u = np.maximum(u_half + 0.5 * du_dt * dt, cfg.MIN_TEMP)
+            self.step_count += 1
+
+            # State Transitions
+            if self.state == "COLLAPSING":
+                self.u *= cfg.COLLAPSE_COOL_RATE
+                max_rho = np.max(rho)
+                duration = self.time - self.collapse_start_time
+                if duration > cfg.COLLAPSE_MIN_DURATION and max_rho > cfg.NUCLEAR_DENSITY:
+                    self.trigger_explosion()
+
+            elif self.state == "EXPLODING":
+                self.vel[self.remnant_mask] *= 0.8
+                self.pos[self.remnant_mask] *= 0.98
+                self.u[self.remnant_mask] = 500.0
+
+    def get_frame_base64(self):
+        """Render current simulation state to a base64 PNG for the web."""
+        fig, ax = plt.subplots(figsize=(7, 7), facecolor='black')
+        ax.set_xlim(-4, 4)
+        ax.set_ylim(-4, 4)
+        ax.set_aspect('equal')
+        ax.axis('off')
+
+        # Background stars
+        rng = np.random.default_rng(123)
+        bg_x = rng.uniform(-4, 4, 300)
+        bg_y = rng.uniform(-4, 4, 300)
+        bg_s = rng.uniform(0.1, 1.5, 300)
+        bg_alpha = rng.uniform(0.1, 0.6, 300)
+        ax.scatter(bg_x, bg_y, s=bg_s, c='white', alpha=bg_alpha, zorder=0)
+
+        colors = ['#550000', '#ff0000', '#ff8800', '#ffff00', '#ffffff', '#aaddff']
+        nodes = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        cmap = LinearSegmentedColormap.from_list("star_temp", list(zip(nodes, colors)))
+
+        dynamic_sizes = 3.0 + 12.0 * np.clip(self.u / 200.0, 0, 1.0)
+        ax.scatter(self.pos[:, 0], self.pos[:, 1],
+                   s=dynamic_sizes, c=self.u, cmap=cmap,
+                   norm=LogNorm(vmin=0.01, vmax=100), alpha=1.0, zorder=15)
+
+        # Neutron star remnant
+        if self.state == "EXPLODING":
+            remnant_pos = self.pos[self.remnant_mask]
+            pulse_size = 40.0 + 10.0 * np.sin(self.step_count * 0.2)
+            ax.scatter(remnant_pos[:, 0], remnant_pos[:, 1],
+                       s=pulse_size, c='white',
+                       edgecolors='cyan', linewidth=1.5, zorder=20)
+
+        color = "#ff4444" if self.state == "COLLAPSING" else ("#ffff44" if self.state == "EXPLODING" else "white")
+        ax.text(0.02, 0.95, f"State: {self.state}  |  Step: {self.step_count}",
+                transform=ax.transAxes, color=color, fontsize=10, family='monospace')
+        ax.text(0.02, 0.02, "Supernova SPH Simulation",
+                transform=ax.transAxes, color='gray', fontsize=9)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', facecolor='black', dpi=100)
+        plt.close(fig)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode('utf-8')
+
+    def run(self):
+        """Original desktop runner — kept intact for local use."""
+        plt.style.use('dark_background')
+        self.fig, self.ax = plt.subplots(figsize=(9, 8), facecolor='black')
+        self.fig.canvas.mpl_connect('key_press_event', self.on_key)
+        self.ax.set_xlim(-4, 4)
+        self.ax.set_ylim(-4, 4)
+        self.ax.set_aspect('equal')
+        self.ax.axis('off')
+
+        rng = np.random.default_rng(123)
+        bg_x = rng.uniform(-4, 4, 300)
+        bg_y = rng.uniform(-4, 4, 300)
+        bg_s = rng.uniform(0.1, 1.5, 300)
+        bg_alpha = rng.uniform(0.1, 0.6, 300)
+        self.ax.scatter(bg_x, bg_y, s=bg_s, c='white', alpha=bg_alpha, zorder=0)
+
+        colors = ['#550000', '#ff0000', '#ff8800', '#ffff00', '#ffffff', '#aaddff']
+        nodes = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        self.star_cmap = LinearSegmentedColormap.from_list("star_temp", list(zip(nodes, colors)))
+
+        self.scat = self.ax.scatter([], [], s=6, c=[], cmap=self.star_cmap,
+                                    norm=LogNorm(vmin=0.01, vmax=100), alpha=1.0, zorder=15, animated=True)
+
+        cbar = plt.colorbar(self.scat, ax=self.ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Temperature (Internal Energy)', color='white')
+        cbar.ax.yaxis.set_tick_params(color='white')
+        plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
+
+        self.remnant_scat = self.ax.scatter([], [], s=40, c='white',
+                                            edgecolors='cyan', linewidth=1.5, zorder=20, animated=True)
+
+        self.text_status = self.ax.text(0.02, 0.95, "", transform=self.ax.transAxes,
+                                        color="white", fontsize=10, family='monospace', animated=True)
+        self.text_inst = self.ax.text(0.02, 0.02,
+                                      "SPACE: Implode | [ / ] : Speed | R: Reset",
+                                      transform=self.ax.transAxes, color="gray", fontsize=9, animated=True)
+
+        self.ani = FuncAnimation(self.fig, self._update_gui, frames=None,
+                                 interval=1, blit=True, cache_frame_data=False)
+        plt.show()
+
+    def on_key(self, event):
+        if event.key == ' ':
+            self.initiate_collapse()
+        elif event.key == 'r':
+            self.reset()
+        elif event.key == 'q':
+            plt.close(self.fig)
+        elif event.key == ']':
+            self.steps_per_frame = min(self.steps_per_frame + 1, 20)
+        elif event.key == '[':
+            self.steps_per_frame = max(self.steps_per_frame - 1, 1)
+
+    def _update_gui(self, frame):
+        """Original GUI update loop — only used when running desktop mode."""
         rho = None
         for _ in range(self.steps_per_frame):
             phys.build_grid(self.pos, self.head, self.next_particle)
             rho, pressure = phys.compute_density_pressure(self.pos, self.u, self.mass_per_particle, self.head,
-                                                     self.next_particle)
+                                                          self.next_particle)
             acc_grav = phys.compute_gravity(self.pos, self.mass_per_particle, self.current_G)
             acc_sph, du_dt = phys.compute_sph_forces(self.pos, self.vel, rho, pressure, self.mass_per_particle,
-                                                self.head, self.next_particle)
+                                                     self.head, self.next_particle)
 
             acc = acc_grav + acc_sph
             if self.damping and self.state == "STABLE":
@@ -156,13 +261,12 @@ class SPHSimulation:
             u_half = np.maximum(u_half, cfg.MIN_TEMP)
             self.pos += vel_half * dt
 
-            # Full-step completion
             phys.build_grid(self.pos, self.head, self.next_particle)
             rho, pressure = phys.compute_density_pressure(self.pos, u_half, self.mass_per_particle, self.head,
-                                                     self.next_particle)
+                                                          self.next_particle)
             acc_grav = phys.compute_gravity(self.pos, self.mass_per_particle, self.current_G)
             acc_sph, du_dt = phys.compute_sph_forces(self.pos, vel_half, rho, pressure, self.mass_per_particle,
-                                                self.head, self.next_particle)
+                                                     self.head, self.next_particle)
 
             acc = acc_grav + acc_sph
             if self.damping and self.state == "STABLE":
@@ -172,7 +276,6 @@ class SPHSimulation:
             self.u = u_half + 0.5 * du_dt * dt
             self.u = np.maximum(self.u, cfg.MIN_TEMP)
 
-            # State Transitions
             if self.state == "COLLAPSING":
                 self.u *= cfg.COLLAPSE_COOL_RATE
                 max_rho = np.max(rho)
@@ -208,10 +311,5 @@ class SPHSimulation:
 
         self.text_status.set_text(status)
         self.text_status.set_color(color)
-
         self.step_count += 1
         return self.scat, self.remnant_scat, self.text_status, self.text_inst
-
-    def run(self):
-        self.ani = FuncAnimation(self.fig, self.update, frames=None, interval=1, blit=True, cache_frame_data=False)
-        plt.show()

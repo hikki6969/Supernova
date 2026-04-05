@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Supernova Simulation</title>
+  <style>
+    body { background: black; color: white; text-align: center; font-family: monospace; }
+    img  { border: 1px solid #333; margin-top: 10px; max-width: 600px; }
+    button {
+      margin: 8px; padding: 10px 24px; font-size: 14px;
+      background: #222; color: white; border: 1px solid #666;
+      cursor: pointer; border-radius: 4px;
+    }
+    button:hover { background: #444; }
+    #status { margin-top: 8px; color: #ffff88; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h2>🌟 Supernova SPH Simulation</h2>
+  <div>
+    <button onclick="collapse()">💥 Initiate Collapse</button>
+    <button onclick="resetSim()">🔄 Reset</button>
+    <button id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
+  </div>
+  <div id="status">State: STABLE | Step: 0</div>
+  <br>
+  <img id="frame" src="" alt="Simulation Frame" />
+
+  <script>
+    let paused = false;
+    let running = false;
+
+    async function fetchFrame() {
+      if (paused || running) return;
+      running = true;
+      try {
+        const r = await fetch('/frame');
+        const d = await r.json();
+        document.getElementById('frame').src = 'data:image/png;base64,' + d.image;
+        document.getElementById('status').textContent =
+          `State: ${d.state} | Step: ${d.step}`;
+      } catch(e) { console.error(e); }
+      running = false;
+    }
+
+    async function collapse() {
+      await fetch('/action/collapse', {method: 'POST'});
+    }
+    async function resetSim() {
+      await fetch('/action/reset', {method: 'POST'});
+    }
+    function togglePause() {
+      paused = !paused;
+      document.getElementById('pauseBtn').textContent = paused ? '▶ Resume' : '⏸ Pause';
+    }
+
+    setInterval(fetchFrame, 100);  // ~10 fps
+  </script>
+</body>
+</html>
