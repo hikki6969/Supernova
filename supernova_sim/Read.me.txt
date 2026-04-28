@@ -1,0 +1,7 @@
+Dependencies
+   pip install numpy matplotlib numba scipy
+
+Run
+   Py main.py
+   or
+   Python -m main.py
